@@ -8,6 +8,9 @@
 #include <sys/wait.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <signal.h>
+#include <errno.h>
+#include <limits.h>
 
 #define CHK(op) do { if ((op) == -1) {perror(""); exit(EXIT_FAILURE);} } while (0)
 #define NCHK(op) do { if ((op) == NULL) {perror(""); exit(EXIT_FAILURE);} } while (0)
@@ -15,7 +18,9 @@
 #define READ_END  0
 #define WRITE_END 1
 
-#define DEFAULT_SIZE 10 
+#define MAX_NUMBER_PIPE 10
+#define MAX_NUMBER_PROCESS MAX_NUMBER_PIPE + 1
+#define MAX_NUMBER_COMMAND 10
 
 
 struct process
@@ -27,14 +32,14 @@ struct process
 	bool is_job;
 	bool is_cd;
 	char* dir_cd;
-	char** command_string; 
+	char* command_string[MAX_NUMBER_COMMAND]; 
 	int nb_command;
 };
 
 struct command
 {
-	struct process* p;
-	int** pipes;
+	struct process p[MAX_NUMBER_PROCESS];
+	int pipes[MAX_NUMBER_PIPE][2];
 	int nb_pipe;
 	int index_command;
 	int index_process;
@@ -43,23 +48,39 @@ struct command
 
 int main(/*int argc, char* argv[]*/)
 {
+	struct sigaction s_pere, s_fils;
+	s_pere.sa_handler = SIG_IGN;
+	s_pere.sa_flags = 0;
+	CHK(sigemptyset(&s_pere.sa_mask));
+	CHK(sigaction(SIGINT, &s_pere, NULL));
+	CHK(sigaction(SIGQUIT, &s_pere, NULL));
+	CHK(sigaction(SIGTSTP, &s_pere, NULL));
+	
 	while(1)
 	{
 		char* cwd = getcwd(NULL, 0);
 		char* login;
 		NCHK(login = getlogin());
-		char hostname[512];
-		CHK(gethostname(hostname, 512));
+		char hostname[HOST_NAME_MAX];
+		CHK(gethostname(hostname, HOST_NAME_MAX));
 		
 		printf("%s@%s:%s$ ", login, hostname, cwd);
 		CHK(fflush(stdout));
 	
 		char* line = NULL;
 		size_t n = 0;
-		if(getline(&line, &n, stdin) == -1)
+		if(getline(&line, &n, stdin) == -1) 
 		{
-			perror("getline");
+			if(errno != 0) //pour ne pas afficher "success" dans le cas d'un CTRL+D (= EOF)
+			{
+				perror("getline");
+			}
+			else 
+			{
+				printf("\n");
+			}
 			free(line);
+			free(cwd);
 			exit(EXIT_FAILURE);
 		}
 		
@@ -69,20 +90,8 @@ int main(/*int argc, char* argv[]*/)
 		c.index_command = 0;
 		c.index_process = 0;
 		c.nb_pipe = 0;
-		NCHK(c.p = calloc(DEFAULT_SIZE, sizeof(struct process))); 
-		for(int i = 0; i < DEFAULT_SIZE; ++i)
-		{
-			NCHK(c.p[i].command_string = calloc(DEFAULT_SIZE, sizeof(char*))); 
-		}
 		
-		NCHK(c.pipes = calloc(DEFAULT_SIZE, sizeof(int*)));
-
-		for(int i = 0; i < DEFAULT_SIZE; ++i)
-		{
-			NCHK(c.pipes[i] = calloc(2, sizeof(int))); 
-		}
-		
-		for(int i = 0; i < DEFAULT_SIZE; ++i)
+		for(int i = 0; i < MAX_NUMBER_PROCESS; ++i)
 		{
 			c.p[i].redir_stdin = false;
 			c.p[i].file_redir_stdin = NULL;
@@ -92,10 +101,6 @@ int main(/*int argc, char* argv[]*/)
 			c.p[i].is_cd = false;
 			c.p[i].dir_cd = NULL;
 		}	
-		
-		int max_size_nb_command = DEFAULT_SIZE;
-		int max_size_nb_process = DEFAULT_SIZE;
-		int max_size_nb_pipe = DEFAULT_SIZE;
 
 		while(token != NULL)
 		{
@@ -140,54 +145,17 @@ int main(/*int argc, char* argv[]*/)
 				c.index_command += 1;
 				c.p[c.index_process].nb_command = c.index_command;
 			}
-			
-			if(c.p[c.index_process].nb_command == max_size_nb_command)
-			{
-				max_size_nb_command *= 2;
-				if((c.p[c.index_process].command_string = reallocarray(c.p[c.index_process].command_string, max_size_nb_command, sizeof(char*))) == NULL)
-				{
-					fprintf(stderr, "Error: reallocarray\n");
-					exit(EXIT_FAILURE);
-				}
-			}
-			
-			if(c.index_process == DEFAULT_SIZE)
-			{
-				max_size_nb_process *= 2;
-				if((c.p = reallocarray(c.p, max_size_nb_process, sizeof(struct process))) == NULL)
-				{
-					fprintf(stderr, "Error: reallocarray\n");
-					exit(EXIT_FAILURE);
-				}
-			}
-			
-			if(c.nb_pipe == DEFAULT_SIZE)
-			{
-				max_size_nb_pipe *= 2;
-				if((c.pipes = reallocarray(c.pipes, max_size_nb_pipe, sizeof(int*))) == NULL)
-				{
-					fprintf(stderr, "Error: reallocarray\n");
-					exit(EXIT_FAILURE);
-				}
-				
-				for(int i = 0; i < max_size_nb_pipe; ++i)
-				{
-					NCHK(c.pipes[i] = calloc(2, sizeof(int))); 
-				}
-			}
-			
 			token = strtok(NULL, " \n");
 		}
 		c.p[c.index_process].command_string[c.index_command] = NULL;
 		
 		for(int i = 0; i < c.nb_pipe; ++i)
 		{
-			NCHK(c.pipes[i] = calloc(1, 2 * sizeof(int)));
 			CHK(pipe(c.pipes[i]));
 		}
 		
 		pid_t pid;
-		int reason;
+		int raison;
 		for(int i = 0; i <= c.index_process; ++i)
 		{
 			switch(pid = fork())
@@ -198,6 +166,13 @@ int main(/*int argc, char* argv[]*/)
 					break;
 				
 				case 0: 
+					s_fils.sa_handler = SIG_DFL;
+					s_fils.sa_flags = 0;
+					CHK(sigemptyset(&s_fils.sa_mask));
+					CHK(sigaction(SIGINT, &s_fils, NULL));
+					CHK(sigaction(SIGTSTP, &s_fils, NULL));
+					CHK(sigaction(SIGQUIT, &s_fils, NULL));
+				
 					if(c.nb_pipe > 0)
 					{
 						if(i == 0) //premier processus
@@ -269,27 +244,13 @@ int main(/*int argc, char* argv[]*/)
 					
 					if(!c.p[i].is_job)
 					{
-						CHK(wait(&reason));
+						CHK(waitpid(-1, &raison, WUNTRACED)); //WUNTRACED est important pour prendre en compte un fils qui a été stoppé par le signal SIGTSTP
 					}
 					break;
 			}
 		}
-		
-		for(int i = 0; i < max_size_nb_pipe; ++i)
-		{
-			free(c.pipes[i]);
-		}
-		
-		free(c.pipes);
-		
-		for(int i = 0; i < max_size_nb_command; ++i) 
-		{
-			free(c.p[i].command_string);
-		}
-		
-		free(c.p);
 		free(line);
 		free(cwd);
 	}
-	return 0;
+	return EXIT_SUCCESS;
 }
